@@ -1,0 +1,198 @@
+
+## ▎消息持久化
+
+>默认情况下重启服务器会导致消息丢失，消息持久化可保证不丢失。
+
+RabbitMQ通过消息持久化来保证消息的可靠性，为了保证RabbitMQ在退出或者发生异常情况下数据不会丢失，必须满足3个条件：queue ，exchange 和 Message 都持久化
+
+**!! 注意：**将queue 和 exchange 设置持久化durable 为true，表示是一个持久化队列和交换机，服务重启之后也会存在，因为服务会把持久化的 queue、exchange 存放在硬盘上，但里面的消息是否为持久化还需要看消息是否做了持久化设置。因此必须3个都持久化，才能保证消息的可靠性！
+
+**1. 交换机持久化**
+
+```java
+@Bean
+public DirectExchange getDirectExchange(){
+   /** @params1 : 交换机名称
+   *  @params2 : 是否持久化（是，重启后不会消失）
+   *  @params3 : 是否自动删除（交换机无消息可投递，则自动删除交换机）
+   */
+   return new DirectExchange("direct_Exchange",true,false);
+}
+```
+
+**2. 队列持久化**
+
+```java
+// 2.声明创建过期队列队列
+@Bean
+public Queue getTTL_Queue1(){
+    /** @params1 : 队列名称
+    *  @params2 : 是否持久化（true：重启后不会消失）
+    *  @params3 : 是否独占队列（true：仅限于此连接使用）
+    *  @params4 : 是否自动删除（队列内最后一条消息被消费后，队列将自动删除）
+    */
+    return new Queue("ttl_Queue1",true,false,false,map);
+}
+```
+
+**3. 消息持久化**
+
+```java
+public void createOrder(String userId, String productId, int num){
+        // 1.根据商品ID查询库存是否充足
+         ....
+
+        // 2.生成订单
+        String orderId = UUID.randomUUID().toString();
+        System.out.println("订单生成成功....");
+
+        MessagePostProcessor processor = new MessagePostProcessor() {
+            @Override
+            public Message postProcessMessage(Message message) throws AmqpException {        
+
+                // 设置消息持久化
+                message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+
+                return message;
+            }
+        };
+        // 3.将订单id封装成MQ消息，投递到交换机
+        /**@params1 ：交换机名称
+         * @params2 ：RoutingKey路由键/队列名称
+         * @params3 ：消息内容
+         */
+        template.convertAndSend("direct_Exchange","message_ttl",orderId,processor);
+    }
+
+上述是springboot设置方式，如果是channel直接发送消息的，参数3需要设置消息为文本格式
+channel.basicPublish(x, x, MessageProperties.PERSISTENT_TEXT_PLAIN,x)
+```
+
+
+
+**☁ 思考：将以上三者等都设置了持久化之后就能保证100%保证数据不丢失？**
+
+答：不能完全保证。
+
+从消费端来说，如果autoAck=true，接收到消息之后，还没来得及处理，消息就奔溃掉了，这种情况需要设置为手动应答模式
+
+其次，消息在正确存入RabbitMQ之后，还需要有一段时间（时间很短，但不可忽视）才能存入磁盘之中，RabbitMQ并不是为每条消息都做刷盘处理。消息保存到cache但是还没来得及落盘，此时发生故障，消息也会丢失
+
+>RabbitMQ的可靠性涉及producer端的确认机制、broker端的镜像队列的配置以及consumer端的确认机制，要想确保消息的可靠性越高，那么性能也会随之而降，鱼和熊掌不可兼得，关键在于选择和取舍。
+
+### 
+
+
+
+### ★ 持久化工作原理
+
+简单来说就是将数据存入磁盘，而不是存在内存中随服务器重启断开而消失，使数据能够永久保存，重启后数据能够从磁盘中读取恢复
+
+RabbitMQ会将你的持久化消息写入磁盘上的持久化日志文件，等消息被消费之后，RabbitMQ会把这条消息标识为等待垃圾回收。
+
+
+
+**☁ 思考：消息什么时候刷到磁盘？**
+
+写入文件前会有一个Buffer，大小为1M，数据在写入文件时，会写入到这个Buffer，如果Buffer已满，则会将Buffer写入到文件（未必刷到磁盘）。 有个固定的刷盘时间：25ms，也就是不管Buffer满不满，每个25ms，Buffer里的数据及未刷新到磁盘的文件内容必定会刷到磁盘。 每次消息写入后，如果没有后续写入请求，则会直接将已写入的消息刷到磁盘：使用Erlang的receive x after 0实现，只要进程的信箱里没有消息，则产生一个timeout消息，而timeout会触发刷盘操作。
+
+ &nbsp;
+
+### ✷ 持久化的缺点
+
+性能低，写入硬盘要比写入内存性能较低很多，从而降低了服务器的吞吐量，尽管使用SSD硬盘可以使事情得到缓解，但他仍然吸干了Rabbit的性能，当消息成千上万条要写入磁盘时，性能是很低的。
+
+>所以使用者要根据自己的情况，选择适合自己的方式。
+
+
+
+### ☛ 常见的持久化方式
+
+
+ &nbsp;
+
+
+
+## ▎消息的高可用
+
+>指产品在规定的条件和规定的时刻或时间内处于可执行规定功能状态的能力。
+
+当业务量增加请求也过大时，一台消息中间件服务器的会触及硬件（cpu、内存、磁盘）的极限，一台消息服务器已无法满足业务的需求，故消息中间件必须**支持集群部署**，来达到高可用的目的
+
+
+
+### 集群模式1—Master-slave主从共享数据的部署方式
+
+>所有节点共享一块数据区域，master负责写入，消费者消费哪个节点都可以。此方式对共享数据区域块有很高的要求，一旦共享区域没了，所有节点也无法消费了
+
+
+![img](https://img-blog.csdnimg.cn/50aa76d26265434692a3502ae1920b02.png?x-oss-process=image/watermark,type_d3F5LXplbmhlaQ,shadow_50,text_Q1NETiBAwrfmooXoirHljYHkuIk=,size_20,color_FFFFFF,t_70,g_se,x_16)
+
+**✦ 解说：**所有的主从节点Broker 都链接到数据共享区域，Master节点负责写入，一旦Master挂掉，slave节点继续服务，从而形成高可用。
+
+
+
+
+
+### 集群模式2—Master-slave主从同步部署方式
+
+>单写多读。Master负责写入，主节点会同步数据到其他slave节点形成副本。
+
+
+![img](https://img-blog.csdnimg.cn/4070d07634f44d29889ebc1bc18ce42e.png?x-oss-process=image/watermark,type_d3F5LXplbmhlaQ,shadow_50,text_Q1NETiBAwrfmooXoirHljYHkuIk=,size_20,color_FFFFFF,t_70,g_se,x_16)
+
+**✦ 解说：**和zookeeper或者redis主从机制很类同，这样可以达到负载均衡的效果，如果消费者有多个，则可以去不同的节点进行消费。
+
+><strong><span style="color:#be191c;">!! </span>注意：</strong>消息的拷贝和同步会占用很大的贷款和网络资源，因此最好部署在同一个机房内，同一个局域网内，性能才能保证
+
+
+
+### 集群模式3—多主集群同步部署模式
+
+>每个节点都是“主节点”，消息往各个节点都同步写入一份。
+
+
+![img](https://img-blog.csdnimg.cn/5cadec6e762741ac9a3007f4036b148d.png?x-oss-process=image/watermark,type_d3F5LXplbmhlaQ,shadow_50,text_Q1NETiBAwrfmooXoirHljYHkuIk=,size_20,color_FFFFFF,t_70,g_se,x_16)
+
+**✦ 解说：**多写多读，消息都会写入到各个节点中，任意节点写入，任意节点读取。
+
+
+
+
+
+### 集群模式4—多主集群转发部署模式
+
+>消息每次只写入一个节点，但不限于写入哪个节点，一条消息只在一个节点存储，不会同步到其他节点，从而减少空间资源的浪费。节点除了存有消息本体，还维护一份元数据信息。
+
+
+![img](https://img-blog.csdnimg.cn/2c151819e562402fa9c4f9e173ecdbdb.png?x-oss-process=image/watermark,type_d3F5LXplbmhlaQ,shadow_50,text_Q1NETiBAwrfmooXoirHljYHkuIk=,size_20,color_FFFFFF,t_70,g_se,x_16)
+
+&nbsp;**✦ 解说：**数据消息太大，每个节点都放一份的话，会造成空间浪费。因此在此基础上每个节点维护一份元数据信息，元数据信息会存储数据的相关描述和记录存放的位置，它会对描述信息也就是元数据信息进行同步。
+
+元数据信息不存放消息本体。只存放消息的描述信息，比如“标签，队列名，连接信息”，各个节点都有一份元数据信息，并且给它们互相建立一个关系。消费者消费消息，先会去元数据信息里匹配，匹配到直接返回消息，没匹配到，则把消息的信息携带到请求中，转发请求到别的服务器（节点）中询问，如果有就返回，直到询问完所有节点为止。
+
+>比如：插入的数据是broker-1中，消费者在broker-2中进行消费，broker-2根据元数据信息匹配，发现自己没有对应的消息体，就把消息的信息携带到请求中，转发到broker-1去查询，最终返回对应的消息体。
+
+
+
+**☛ 总而言之，消息的高可用围绕以下三点展开**
+
+1. 要么消息共享 
+2. 要么消息同步 
+3. 要么元数据共享
+
+
+
+
+
+## 消息的高可靠
+
+>系统可以无故障低持续运行，比如一个系统突然崩溃，报错，异常等等并不影响线上业务的正常运行，出错的几率极低，就称之为：高可靠。
+
+**如何保证中间件消息的可靠性呢？可以从两个方面考虑：**
+
+1.  消息的传输：通过协议来保证系统间数据解析的正确性  
+2.  消息的存储可靠：通过持久化来保证消息的可靠性 
+
+
+
